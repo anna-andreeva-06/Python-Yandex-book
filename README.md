@@ -346,6 +346,11 @@ print("Дубликатов по user_id + event_dt в events:", events.duplicat
 
 ## 2. По таблице `ab_test_participants` оцените корректность проведения теста:
 
+#### 2.1. Выделим пользователей, участвующих в тесте, и проверим:
+- соответствие требованиям технического задания,
+- равномерность распределения пользователей по группам теста,
+- отсутствие пересечений с конкурирующим тестом (нет пользователей, участвующих одновременно в двух тестовых группах).
+
 ```
 # Выделяем пользователей только из теста 'interface_eu_test'
 test_participants = participants[participants['ab_test'] == 'interface_eu_test'].copy()
@@ -398,3 +403,294 @@ else:
 * Разница между группами: 1.06% (A как базовая) - небольшая, группы сбалансированы (разница << 10–15%, что допустимо)
 * Пересечений с конкурирующим тестом (recommender_system_test): 0 пользователей
 
+#### 2.2.Проанализируем данные о пользовательской активности по таблице `ab_test_events`:
+- оставим только события, связанные с участвующими в изучаемом тесте пользователями;
+- определим горизонт анализа: рассчитаем время (лайфтайм) совершения события пользователем после регистрации и оставим только те события, которые были выполнены в течение первых семи дней с момента регистрации;
+- рассчитаем для каждой группы количество посетителей, сделавших покупку, и общее количество посетителей.
+
+```
+# мы веделили участников выше, но в этом блоке мы переходим к работе именно с таблицей событий, и чтобы код был максимально независимым и читаемым, заново создаем чистую выборку участников теста прямо в этом блоке.
+
+# 1. Получаем очищенных участников теста 'interface_eu_test'
+test_participants = participants[participants['ab_test'] == 'interface_eu_test'].drop_duplicates(subset='user_id', keep='first')
+
+# 2. Множество валидных user_id
+valid_users = set(test_participants['user_id'])
+
+# 3. Фильтруем события только по этим пользователям
+events_test = events[events['user_id'].isin(valid_users)].copy()
+
+# Вывод результатов
+print("Исходный размер events:", events.shape)
+print("Размер events после фильтрации по участникам теста:", events_test.shape)
+print("Уникальных пользователей в отфильтрованных событиях:", events_test['user_id'].nunique())
+```
+
+<img width="403" height="47" alt="image" src="https://github.com/user-attachments/assets/59bc0b91-276e-49b1-a128-09a90274dd1c" />
+
+```
+# 1. Находим дату регистрации для каждого пользователя (самое раннее событие 'registration')
+registrations = events_test[events_test['event_name'] == 'registration']\
+    .groupby('user_id')['event_dt']\
+    .min()\
+    .reset_index()\
+    .rename(columns={'event_dt': 'registration_dt'})
+
+print("Количество пользователей с событием 'registration':", len(registrations))
+
+# 2. Добавляем дату регистрации к таблице событий (merge по user_id)
+events_with_reg = events_test.merge(
+    registrations[['user_id', 'registration_dt']],
+    on='user_id',
+    how='left'
+)
+
+# 3. Рассчитываем лайфтайм в днях (разница между датой события и датой регистрации)
+events_with_reg['lifetime_days'] = (events_with_reg['event_dt'] - events_with_reg['registration_dt']).dt.days
+
+# Проверка пропусков (если у кого-то нет регистрации)
+print("\nПропуски в registration_dt:", events_with_reg['registration_dt'].isna().sum())
+print("Событий без даты регистрации:", events_with_reg['registration_dt'].isna().sum())
+
+# 4. Оставляем только события с лайфтаймом от 0 до 6 дней включительно
+# (lifetime_days >= 0 и <= 6; NaN исключаем)
+events_7days = events_with_reg[
+    (events_with_reg['lifetime_days'] >= 0) & 
+    (events_with_reg['lifetime_days'] <= 6) &
+    (events_with_reg['registration_dt'].notna())
+].copy().reset_index(drop=True)
+
+print("\nРазмер событий после фильтрации по лайфтайму ≤ 7 дней:", events_7days.shape)
+print("Уникальных пользователей в отфильтрованных событиях:", events_7days['user_id'].nunique())
+```
+
+<img width="381" height="19" alt="image" src="https://github.com/user-attachments/assets/cea87744-f6ed-4b26-84a4-2631ca222429" />
+
+<img width="205" height="39" alt="image" src="https://github.com/user-attachments/assets/ebd57915-1eca-4f11-b8e8-a2f683a06372" />
+
+<img width="421" height="31" alt="image" src="https://github.com/user-attachments/assets/31837bca-e9fb-4a21-a9e1-8d92ec7c4eac" />
+
+```
+# Краткая статистика по лайфтайму
+print("\nСтатистика лайфтайма (дней после регистрации):")
+print(events_7days['lifetime_days'].describe().round(2))
+
+# Проверка распределения событий по дням после регистрации
+print("\nРаспределение событий по дням после регистрации:")
+print(events_7days['lifetime_days'].value_counts().sort_index())
+```
+
+<img width="316" height="289" alt="image" src="https://github.com/user-attachments/assets/02ca67b9-35eb-4589-b9ad-878e324abaaf" />
+
+Данные о событиях успешно отфильтрованы по участникам теста и ограничены горизонтом анализа в 7 дней после регистрации.  
+Большинство активности происходит в день регистрации и на следующий день - это типично для e-commerce.  
+Нет потерь пользователей: все 10 403 участника теста имеют хотя бы одно событие в первые 7 дней.
+
+Оценим достаточность выборки для получения статистически значимых результатов A/B-теста:
+
+```
+# Параметры из ТЗ
+baseline_cr = 0.30          # базовая конверсия 30%
+alpha = 0.05                # достоверность 95% - уровень значимости α = 5%
+power = 0.80                # мощность теста 80%
+mde_absolute = 0.03         # минимальный детектируемый эффект +3 п.п. (абсолютный)
+
+# Рассчитываем effect size для долевой метрики
+effect_size = proportion_effectsize(
+    prop1=baseline_cr, 
+    prop2=baseline_cr + mde_absolute
+)
+
+# Инициализация калькулятора мощности
+analysis = NormalIndPower()
+
+# Расчёт минимального размера выборки на одну группу (при ratio=1 → A:B = 1:1)
+sample_size_per_group = analysis.solve_power(
+    effect_size=effect_size,
+    power=power,
+    alpha=alpha,
+    ratio=1.0
+)
+
+# Округляем вверх до целого
+sample_size_per_group = ceil(sample_size_per_group)
+
+total_sample = sample_size_per_group * 2
+
+print(f"Минимальный размер выборки на одну группу (A или B): {sample_size_per_group:} пользователей")
+print(f"Общий необходимый размер выборки (A + B): {total_sample:} пользователей")
+print(f"Параметры теста:")
+print(f"  - Базовая конверсия: {baseline_cr*100}%")
+print(f"  - MDE: +{mde_absolute*100} п.п.")
+print(f"  - Уровень значимости α: {alpha}")
+print(f"  - Мощность теста: {power*100}%")
+```
+
+<img width="459" height="101" alt="image" src="https://github.com/user-attachments/assets/3605a1cf-a37a-4d77-bac9-59aa21152f80" />
+
+При базовой конверсии 30%, желаемом подъёме на 3 п.п., α=0.05 и мощности 80% тест требует минимум 3762 пользователя на группу (всего 7524). Если в данных после очистки участников меньше - тест может оказаться недостаточно мощным для обнаружения заявленного эффекта.
+
+Рассчитаем для каждой группы количество посетителей, сделавших покупку, и общее количество посетителей:
+
+```
+# Добавляем столбец group к событиям (сливаем с test_participants)
+events_7days_with_group = events_7days.merge(
+    test_participants[['user_id', 'group']], 
+    on='user_id', 
+    how='left'
+)
+
+# Проверяем, что группа добавилась
+print("Столбцы после слияния:", events_7days_with_group.columns.tolist())
+
+# 1. Общее количество уникальных посетителей (пользователей) в каждой группе
+total_visitors = events_7days_with_group.groupby('group')['user_id'].nunique().reset_index()
+total_visitors.rename(columns={'user_id': 'total_visitors'}, inplace=True)
+
+print("\nОбщее количество посетителей по группам:")
+print(total_visitors)
+
+# 2. Количество пользователей, совершивших покупку ('purchase') в первые 7 дней
+purchases = events_7days_with_group[events_7days_with_group['event_name'] == 'purchase']\
+    .groupby('group')['user_id']\
+    .nunique()\
+    .reset_index()\
+    .rename(columns={'user_id': 'purchases'})
+
+print("\nКоличество пользователей с покупкой по группам:")
+print(purchases)
+
+# 3. Объединяем и считаем конверсию
+conversion = total_visitors.merge(purchases, on='group', how='left')
+conversion['purchases'] = conversion['purchases'].fillna(0).astype(int)
+conversion['conversion_rate'] = (conversion['purchases'] / conversion['total_visitors'] * 100).round(2)
+
+print("\nИтоговая таблица (посетители, покупки, конверсия):")
+print(conversion)
+```
+
+<img width="653" height="32" alt="image" src="https://github.com/user-attachments/assets/fa0e7c93-3f71-4435-a497-d69f898fbb60" />
+
+<img width="266" height="61" alt="image" src="https://github.com/user-attachments/assets/043e57db-4076-4cfc-98c4-e91e8f71450e" />
+
+<img width="305" height="58" alt="image" src="https://github.com/user-attachments/assets/a17082b7-7903-4e6e-a2b2-028cb225bca6" />
+
+<img width="333" height="64" alt="image" src="https://github.com/user-attachments/assets/94d85785-5452-4a16-858f-0a6cdcef43d7" />
+
+```
+# Разница в конверсии (B - A)
+conv_a = conversion[conversion['group'] == 'A']['conversion_rate'].values[0]
+conv_b = conversion[conversion['group'] == 'B']['conversion_rate'].values[0]
+diff = conv_b - conv_a
+
+print(f"\nРазница в конверсии (B - A): {diff:.2f}%")
+if diff > 0:
+    print(f"Группа B показывает рост конверсии на {diff:.2f}% по сравнению с A.")
+else:
+    print(f"Группа B показывает падение конверсии на {abs(diff):.2f}% по сравнению с A.")
+```
+
+<img width="402" height="39" alt="image" src="https://github.com/user-attachments/assets/39098142-6f3d-4d4e-878f-9a858095174e" />
+
+После очистки данных, фильтрации событий по участникам теста `interface_eu_test` и ограничения горизонтом в 7 дней после регистрации получены следующие результаты по ключевой метрике - конверсия в покупку (событие `purchase`):
+
+* Группа A (контрольная, старый интерфейс):
+    * Посетителей: 5174
+    * Покупок: 1427
+    * Конверсия: 27.58%
+
+* Группа B (тестовая, новый упрощённый интерфейс):
+    * Посетителей: 5229
+    * Покупок: 1532
+    * Конверсия: 29.30%
+
+* Разница в конверсии (B - A): +1.72 процентных пункта
+
+Новая версия сайта (группа B) показывает рост конверсии в покупку в первые 7 дней после регистрации на +1.72 п.п. по сравнению с контрольной группой.  
+Это положительное изменение соответствует гипотезе теста (упрощение интерфейса должно увеличить конверсию), но заявленный в ТЗ минимальный эффект (+3 п.п.) не достигнут.  
+На данном этапе наблюдается умеренный рост активности в тестовой группе, однако для принятия решения о внедрении необходимо провести статистический тест на значимость разницы (p-value) и оценить, не является ли улучшение случайным.  
+Данные по размерам групп и конверсии выглядят сбалансированными и надёжными после очистки.
+
+---
+
+## 3. Проведите оценку результатов A/B-тестирования:
+
+Проверим изменение конверсии подходящим статистическим тестом, учитывая все этапы проверки гипотез.
+
+Используем Z-тест пропорций, так как это стандарт для бинарных метрик (конверсия = доля покупок среди посетителей), а выборки достаточно большие. Тест односторонний, потому что гипотеза направленная: новый интерфейс увеличивает конверсию (B > A).
+
+```
+# Извлекаем нужные значения
+n_a = conversion[conversion['group'] == 'A']['total_visitors'].values[0]   # общее число посетителей в A
+n_b = conversion[conversion['group'] == 'B']['total_visitors'].values[0]   # общее число посетителей в B
+
+success_a = conversion[conversion['group'] == 'A']['purchases'].values[0]  # покупки в A
+success_b = conversion[conversion['group'] == 'B']['purchases'].values[0]  # покупки в B
+```
+
+```
+# 1. Проверка предпосылок Z-теста (np > 5 и n(1-p) > 5 для каждой группы)
+print("Проверка предпосылок Z-теста:")
+print(f"Группа A: покупки = {success_a}, n = {n_a}, np = {success_a}, n(1-p) = {n_a - success_a}")
+print(f"Группа B: покупки = {success_b}, n = {n_b}, np = {success_b}, n(1-p) = {n_b - success_b}")
+
+if min(success_a, n_a - success_a, success_b, n_b - success_b) > 5:
+    print("Предпосылки выполнены - можно применять Z-тест пропорций")
+else:
+    print("Предпосылки НЕ выполнены - лучше использовать точный тест Фишера")
+```
+
+<img width="390" height="60" alt="image" src="https://github.com/user-attachments/assets/c07fbe3d-8102-4d2a-8c4c-b9c26b98f561" />
+
+```
+# 2. Односторонний Z-тест пропорций (H1: p_B > p_A)
+count = np.array([success_b, success_a])      # покупки: сначала тестовая группа B
+nobs = np.array([n_b, n_a])                   # размеры выборок
+
+z_stat, p_value_two = proportions_ztest(count, nobs, alternative='larger')  # 'larger' = односторонний B > A
+
+print("\nРезультат Z-теста пропорций (односторонний):")
+print(f"Z-статистика: {z_stat:.4f}")
+print(f"p-value: {p_value_two:.6f}")
+
+alpha = 0.05
+if p_value_two < alpha:
+    print(f"p-value < {alpha} → отвергаем H₀")
+    print("Разница в конверсии статистически значима: новый интерфейс увеличивает конверсию")
+else:
+    print(f"p-value ≥ {alpha} → не отвергаем H₀")
+    print("Разница в конверсии статистически НЕ значима")
+```
+
+<img width="522" height="80" alt="image" src="https://github.com/user-attachments/assets/66b5ddee-dd80-4333-9d9a-9a9935e5a67a" />
+
+---
+
+A/B-тест новой версии сайта (упрощённый интерфейс) показал следующие результаты:
+
+* Конверсия в покупку в первые 7 дней после регистрации
+    * Группа A (контрольная, старый интерфейс): 27.58% (1427 покупок из 5174 посетителей)
+    * Группа B (тестовая, новый интерфейс): 29.30% (1532 покупок из 5229 посетителей)
+    * Разница (B - A): +1.72 процентных пункта
+
+* Статистическая значимость  
+  Z-тест пропорций (односторонний, H₁: конверсия B > A):
+    * Z-статистика: 1.9419  
+    * p-value: 0.026073  
+p-value < 0.05 - нулевая гипотеза отвергается на уровне значимости 5%. Разница в конверсии **статистически значима**.
+
+**Был ли достигнут ожидаемый эффект?**  
+Ожидаемый минимальный подъём конверсии по ТЗ: +3 п.п.  
+Фактический подъём: +1.72 п.п.  
+Следовательно, ожидаемый эффект не достигнут в полном объёме.  
+Однако улучшение есть и оно статистически значимо (p = 0.03), что говорит о положительном влиянии упрощённого интерфейса на конверсию.
+
+**Заключение:**
+
+Новый интерфейс положительно повлиял на конверсию в покупку (+1.72 п.п., статистически значимо), но не достиг заявленного в ТЗ минимального эффекта в +3 п.п.  
+Результат можно считать умеренно успешным: рост есть, но он ниже ожидаемого порога для безопасного внедрения на всю аудиторию.
+
+*Рекомендации:*
+* Внедрить новый интерфейс на часть трафика (например, 20–30%) для дополнительного мониторинга в течение 2–4 недель.
+* Провести повторный тест с большим MDE (например, 2–2.5 п.п.) или увеличить мощность теста, если цель - поймать меньшие эффекты.
+* Дополнительно проанализировать, на каких этапах воронки (product_page - product_cart - purchase) происходит основной прирост конверсии - это поможет понять, где именно упрощение интерфейса сработало лучше всего.
